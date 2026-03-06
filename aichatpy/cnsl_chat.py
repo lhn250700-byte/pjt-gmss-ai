@@ -1,0 +1,154 @@
+"""
+화상상담 채팅 API (chat_msg).
+- GET  /api/cnsl/{cnsl_id}/chat : 채팅 메시지 목록 조회
+- POST /api/cnsl/{cnsl_id}/chat : 메시지 전송 및 저장
+"""
+from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
+
+# DB 함수들 임포트
+from chat_msg_db import (
+    DATABASE_URL,
+    append_chat_content,
+    cnsl_reg_exists,
+    get_cnsl_reg,
+    get_chat_msg_by_cnsl,
+    member_exists_by_email,
+    update_cnsl_stat,
+    upsert_chat_msg_summary,
+)
+
+# [수정] tags 추가 및 prefix 확인
+router = APIRouter(prefix="/api/cnsl", tags=["cnsl-chat"])
+
+def get_member_email(x_user_email: str | None = Header(None, alias="X-User-Email")) -> str:
+    email = (x_user_email or "").strip()
+    if not email:
+        raise HTTPException(status_code=401, detail="X-User-Email 헤더가 필요합니다.")
+    if not member_exists_by_email(email):
+        raise HTTPException(status_code=401, detail="존재하지 않는 사용자입니다.")
+    return email
+
+def _validate_cnsl_access(cnsl_id: int, current_email: str) -> None:
+    if not cnsl_reg_exists(cnsl_id):
+        raise HTTPException(status_code=404, detail="해당 상담 ID를 찾을 수 없습니다.")
+    reg = get_cnsl_reg(cnsl_id)
+    if not reg:
+        raise HTTPException(status_code=404, detail="해당 상담 정보를 찾을 수 없습니다.")
+    member_id = reg.get("member_id") or ""
+    cnsler_id = reg.get("cnsler_id") or ""
+    if current_email != member_id and current_email != cnsler_id:
+        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
+
+def _flatten_to_frontend_format(row: dict, member_id: str, cnsler_id: str) -> list:
+    if not row: return []
+    msg_data = row.get("msg_data") or {}
+    content = msg_data.get("content")
+    if not isinstance(content, list): return []
+    chat_id = row.get("chat_id")
+    cnsl_id = row.get("cnsl_id")
+    summary = row.get("summary") or ""
+    out = []
+    for idx, item in enumerate(content):
+        if not isinstance(item, dict): continue
+        speaker = (item.get("speaker") or "user").lower()
+        text = str(item.get("text") or "")
+        ts = item.get("timestamp")
+        role = "counselor" if speaker in ("cnsler", "counselor") else "user"
+        out.append({
+            "chatId": f"{chat_id}-{idx}" if chat_id else f"msg-{ts or idx}",
+            "cnslId": cnsl_id,
+            "cnslerId": cnsler_id,
+            "memberId": member_id,
+            "createdAt": ts,
+            "created_at": ts,
+            "summary": summary,
+            "content": text,
+            "role": role,
+        })
+    return out
+
+class PostChatBody(BaseModel):
+    role: str
+    content: str | None = None
+    summary: str | None = None
+
+# --- API Endpoints ---
+
+@router.get("/{cnsl_id}/chat")
+async def get_chat_messages(cnsl_id: int, member_id: str = Depends(get_member_email)):
+    # 1. 먼저 상담 정보를 가져옵니다.
+    reg = get_cnsl_reg(cnsl_id)
+    if not reg:
+        raise HTTPException(status_code=404, detail="상담 정보를 찾을 수 없습니다.")
+    
+    # 2. 채팅 메시지 목록을 가져옵니다.
+    row = get_chat_msg_by_cnsl(cnsl_id)
+    if not row: 
+        return []
+        
+    # 3. 이제 정의된 reg 변수를 사용합니다.
+    return _flatten_to_frontend_format(row, reg.get("member_id"), reg.get("cnsler_id"))
+
+@router.post("/{cnsl_id}/chat")
+async def post_chat_message(cnsl_id: int, body: PostChatBody, member_id: str = Depends(get_member_email)):
+    _validate_cnsl_access(cnsl_id, member_id)
+    role = (body.role or "").strip().lower()
+    content = (body.content or body.summary or "").strip()
+    summary_val = body.summary.strip() if body.summary else None
+    if role == "summary": summary_val = content
+    
+    speaker = "cnsler" if role in ("counselor", "cnsler") else "user"
+    reg = get_cnsl_reg(cnsl_id)
+    
+    row = append_chat_content(
+        cnsl_id=cnsl_id,
+        member_email=reg.get("member_id"),
+        cnsler_email=reg.get("cnsler_id"),
+        speaker=speaker,
+        text=content,
+        summary_val=summary_val,
+        request_role=role,
+    )
+    created = row.get("created_at")
+    if hasattr(created, "isoformat"): created = created.isoformat()
+    return {
+        "chatId": row.get("chat_id"),
+        "cnslId": row.get("cnsl_id"),
+        "createdAt": created,
+        "msg_data": row.get("msg_data"),
+    }
+
+class PatchStatBody(BaseModel):
+    cnslStat: str
+
+@router.patch("/{cnsl_id}/stat")
+async def patch_cnsl_stat(cnsl_id: int, body: PatchStatBody, member_id: str = Depends(get_member_email)):
+    _validate_cnsl_access(cnsl_id, member_id)
+    stat = (body.cnslStat or "").strip().upper()
+    if stat not in ("C", "D"):
+        raise HTTPException(status_code=400, detail="C 또는 D만 가능합니다.")
+    if not update_cnsl_stat(cnsl_id, stat):
+        raise HTTPException(status_code=500, detail="업데이트 실패")
+    return {"cnslId": cnsl_id, "cnslStat": stat}
+
+class PostSummaryFullBody(BaseModel):
+    summary: str
+    summary_line: str | None = None
+    msg_data: list
+
+@router.post("/{cnsl_id}/chat/summary-full")
+async def post_summary_full(cnsl_id: int, body: PostSummaryFullBody, member_id: str = Depends(get_member_email)):
+    _validate_cnsl_access(cnsl_id, member_id)
+    reg = get_cnsl_reg(cnsl_id)
+    row = upsert_chat_msg_summary(
+        cnsl_id=cnsl_id,
+        member_email=reg.get("member_id"),
+        cnsler_email=reg.get("cnsler_id"),
+        summary=body.summary,
+        summary_line=body.summary_line,
+        msg_data_content=body.msg_data,
+    )
+    created = row.get("created_at")
+    if hasattr(created, "isoformat"): created = created.isoformat()
+    return {"chatId": row.get("chat_id"), "cnslId": cnsl_id, "createdAt": created}
